@@ -1650,6 +1650,8 @@ static CONF_PARSER ocsp_config[] = {
 	{ "use_nonce", FR_CONF_OFFSET(PW_TYPE_BOOLEAN, fr_tls_server_conf_t, ocsp_use_nonce), "yes" },
 	{ "timeout", FR_CONF_OFFSET(PW_TYPE_INTEGER, fr_tls_server_conf_t, ocsp_timeout), "yes" },
 	{ "softfail", FR_CONF_OFFSET(PW_TYPE_BOOLEAN, fr_tls_server_conf_t, ocsp_softfail), "no" },
+	{ "stapling", FR_CONF_OFFSET(PW_TYPE_BOOLEAN, fr_tls_server_conf_t, ocsp_stapling), "no" },
+	{ "stapling_cache", FR_CONF_OFFSET(PW_TYPE_STRING, fr_tls_server_conf_t, ocsp_stapling_cache), NULL },
 	CONF_PARSER_TERMINATOR
 };
 #endif
@@ -2633,6 +2635,92 @@ static int ocsp_parse_cert_url(X509 *cert, char **host_out, char **port_out,
 	return found_uri ? -1 : 0;
 }
 
+static bool ocsp_cache_verify(OCSP_CERTID *certid, OCSP_RESPONSE *resp) {
+	int status = 0;
+	int reason = 0;
+	OCSP_BASICRESP *bresp = NULL;
+	ASN1_GENERALIZEDTIME *rev = NULL, *thisupd, *nextupd;
+
+	bresp = OCSP_response_get1_basic(resp);
+	if (!bresp)
+		return false;
+
+	if (!OCSP_resp_find_status(bresp, certid, &status, &reason, &rev, &thisupd, &nextupd)) {
+		OCSP_BASICRESP_free(bresp);
+		return false;
+	}
+
+	if (!OCSP_check_validity(thisupd, nextupd, 0, -1)) {
+		OCSP_BASICRESP_free(bresp);
+		return false;
+	}
+
+	OCSP_BASICRESP_free(bresp);
+
+	return true;
+}
+
+static size_t ocsp_cache_load(OCSP_CERTID *certid, const char *file, uint8_t **respder)
+{
+	BIO *bio;
+	size_t rspderlen;
+	u_char *p;
+	OCSP_RESPONSE *resp = NULL;
+	int len;
+
+	if (!certid)
+		return 0;
+
+	bio = BIO_new_file(file, "rb");
+	if (!bio)
+		return 0;
+
+	resp = d2i_OCSP_RESPONSE_bio(bio, NULL);
+	if (!resp) {
+		BIO_free(bio);
+		return 0;
+	}
+
+	len = i2d_OCSP_RESPONSE(resp, NULL);
+	if (len <= 0) {
+		OCSP_RESPONSE_free(resp);
+		BIO_free(bio);
+		return 0;
+	}
+
+	if (!ocsp_cache_verify(certid, resp)) {
+		OCSP_RESPONSE_free(resp);
+		BIO_free(bio);
+		return 0;
+	}
+
+	*respder = malloc(len);
+	if (!*respder) {
+		OCSP_RESPONSE_free(resp);
+		BIO_free(bio);
+		return 0;
+	}
+
+	p = *respder;
+	rspderlen = i2d_OCSP_RESPONSE(resp, &p);
+
+	OCSP_RESPONSE_free(resp);
+	BIO_free(bio);
+
+	return rspderlen;
+}
+
+static void ocsp_cache_save(const char *file, unsigned char *rspder, int rspderlen)
+{
+	FILE *fp = fopen(file, "w");
+	if (!fp)
+		return;
+
+	fwrite(rspder, rspderlen, 1, fp);
+
+	fclose(fp);
+}
+
 /*
  * This function sends a OCSP request to a defined OCSP responder
  * and checks the OCSP response for correctness.
@@ -2647,8 +2735,8 @@ typedef enum {
 	OCSP_STATUS_SKIPPED	= 2,
 } ocsp_status_t;
 
-static ocsp_status_t ocsp_check(REQUEST *request, X509_STORE *store, X509 *issuer_cert, X509 *client_cert,
-				STACK_OF(X509) *untrusted, fr_tls_server_conf_t *conf)
+static ocsp_status_t ocsp_check(REQUEST *request, SSL *ssl, STACK_OF(X509) *certs, X509_STORE *store, X509 *issuer_cert, X509 *client_cert,
+				fr_tls_server_conf_t *conf, bool is_stapling)
 {
 	OCSP_CERTID	*certid;
 	OCSP_REQUEST	*req;
@@ -2678,10 +2766,22 @@ static ocsp_status_t ocsp_check(REQUEST *request, X509_STORE *store, X509 *issue
 		goto skipped;
 	}
 
+	certid = OCSP_cert_to_id(NULL, client_cert, issuer_cert);
+
+	if (is_stapling && conf->ocsp_stapling_cache) {
+
+		unsigned char *rspder = NULL;
+		size_t rspderlen = ocsp_cache_load(certid, conf->ocsp_stapling_cache, &rspder);
+
+		if (rspderlen > 0) {
+			SSL_set_tlsext_status_ocsp_resp(ssl, rspder, rspderlen);
+			return OCSP_STATUS_OK;
+		}
+	}
+
 	/*
 	 * Create OCSP Request
 	 */
-	certid = OCSP_cert_to_id(NULL, client_cert, issuer_cert);
 	req = OCSP_REQUEST_new();
 	OCSP_request_add0_id(req, certid);
 	if (conf->ocsp_use_nonce) OCSP_request_add1_nonce(req, NULL, 8);
@@ -2829,7 +2929,7 @@ static ocsp_status_t ocsp_check(REQUEST *request, X509_STORE *store, X509 *issue
 		REDEBUG("ocsp: Response has wrong nonce value");
 		goto ocsp_end;
 	}
-	if (OCSP_basic_verify(bresp, untrusted, store, 0)!=1){
+	if (OCSP_basic_verify(bresp, certs, store, 0)!=1){
 		REDEBUG("ocsp: Couldn't verify OCSP basic response");
 		goto ocsp_end;
 	}
@@ -2881,19 +2981,21 @@ static ocsp_status_t ocsp_check(REQUEST *request, X509_STORE *store, X509 *issue
 	}
 
 ocsp_end:
-	/* Free OCSP Stuff */
-	OCSP_REQUEST_free(req);
-	OCSP_RESPONSE_free(resp);
-	free(host);
-	free(port);
-	free(path);
-	BIO_free_all(cbio);
-	if (bio_out) BIO_free(bio_out);
-	OCSP_BASICRESP_free(bresp);
 
 	switch (ocsp_status) {
 	case OCSP_STATUS_OK:
 		RDEBUG2("ocsp: Certificate is valid");
+		if (is_stapling) {
+			int rspderlen;
+			unsigned char *rspder = NULL;
+
+			rspderlen = i2d_OCSP_RESPONSE(resp, &rspder);
+			if (rspderlen > 0) {
+				SSL_set_tlsext_status_ocsp_resp(ssl, rspder, rspderlen);
+				if (is_stapling && conf->ocsp_stapling_cache)
+				    ocsp_cache_save(conf->ocsp_stapling_cache, rspder, rspderlen);
+			}
+		}
 		break;
 
 	case OCSP_STATUS_SKIPPED:
@@ -2921,8 +3023,155 @@ ocsp_end:
 		break;
 	}
 
+	/* Free OCSP Stuff */
+	OCSP_REQUEST_free(req);
+	OCSP_RESPONSE_free(resp);
+	free(host);
+	free(port);
+	free(path);
+	BIO_free_all(cbio);
+	if (bio_out) BIO_free(bio_out);
+	OCSP_BASICRESP_free(bresp);
+
 	return ocsp_status;
 }
+
+/** Callback used to get stapling data for the current server cert
+ *
+ * @param ssl	Current SSL session.
+ * @param data	OCSP configuration.
+ */
+static int fr_tls_ocsp_staple_cb(SSL *ssl, void *data)
+{
+	fr_tls_server_conf_t	*conf = data;	/* Alloced as part of fr_tls_conf_t (not talloced) */
+	REQUEST *request = (REQUEST *)SSL_get_ex_data(ssl, FR_TLS_EX_INDEX_REQUEST);
+
+	X509			*cert;
+	X509			*issuer_cert;
+	X509_STORE		*server_store = NULL;
+	X509_STORE_CTX		*server_store_ctx = NULL;
+
+	STACK_OF(X509)		*our_chain = NULL;
+
+	int			ret;
+
+	rad_assert(request != NULL);
+
+	cert = SSL_get_certificate(ssl);
+	if (!cert) {
+		tls_error_log(request, "No server certificate found in SSL session");
+error:
+		X509_STORE_CTX_free(server_store_ctx);
+		X509_STORE_free(server_store);
+
+		return conf->ocsp_softfail ? SSL_TLSEXT_ERR_NOACK : SSL_TLSEXT_ERR_ALERT_FATAL;
+	}
+
+	server_store = SSL_CTX_get_cert_store(SSL_get_SSL_CTX(ssl));
+	if (!server_store) {
+		tls_error_log(request, "Failed retrieving SSL session cert store");
+		goto error;
+	}
+
+	if (SSL_get0_chain_certs(ssl, &our_chain) == 0) {
+	    tls_error_log(request, "Failed retrieving chain certificates from current SSL session");
+	    goto error;
+	}
+
+	MEM(server_store = X509_STORE_new());
+	X509_STORE_set_trust(server_store, 1);	/* All certs are trusted */
+
+	/*
+	 *	Add the chain certificates from the current SSL*
+	 *	to the trusted store so that we can determine
+	 *	the issuer cert of the certificate we presented.
+	 */
+	{
+	    int num = sk_X509_num(our_chain);
+	    int i;
+
+		for (i = 0; i < num; i++) {
+			if (X509_STORE_add_cert(server_store, sk_X509_value(our_chain, i)) != 1) {
+				tls_error_log(request, "Failed adding certificate to trusted store");
+				goto error;
+			}
+	    }
+	}
+
+	/*
+	 *	This is what OpenSSL uses to construct SSL chains
+	 *	for validation.  We just need to use it to find
+	 *	who issued our server certificate.
+	 */
+	MEM(server_store_ctx = X509_STORE_CTX_new());
+	if (X509_STORE_CTX_init(server_store_ctx, server_store, NULL, NULL) == 0) {
+	    tls_error_log(request, "Failed initialising SSL session cert store ctx");
+	    goto error;
+	}
+
+	ret = X509_STORE_CTX_get1_issuer(&issuer_cert, server_store_ctx, cert);
+	if (ret != 1) {
+		X509_NAME	*subject;
+		X509_NAME	*issuer;
+		char		*subject_str;
+		char		*issuer_str;
+
+		subject = X509_get_subject_name(cert);
+		if (!subject) {
+			tls_error_log(request, "Couldn't retrieve subject name of SSL session cert");
+			goto error;
+		}
+		MEM(subject_str = X509_NAME_oneline(subject, NULL, 0));
+
+		issuer = X509_get_issuer_name(cert);
+		if (!issuer) {
+			tls_error_log(request, "Couldn't retrieve issuer name of SSL session cert");
+			OPENSSL_free(subject_str);
+			goto error;
+		}
+		MEM(issuer_str = X509_NAME_oneline(issuer, NULL, 0));
+
+		switch (ret) {
+			case 0:
+				tls_error_log(request, "Issuer \"%s\" of \"%s\" not found in certificate store",
+							issuer_str, subject_str);
+		    break;
+		default:
+			tls_error_log(request, "Error retrieving issuer \"%s\" of \"%s\" from certificate store",
+						issuer_str, subject_str);
+		    break;
+	    }
+
+		OPENSSL_free(subject_str);
+		OPENSSL_free(issuer_str);
+	    goto error;
+	}
+
+	fr_assert(issuer_cert);
+
+	ret = ocsp_check(request, ssl, NULL, server_store, issuer_cert, cert, conf, true);
+	switch (ret) {
+		default:
+		case 0:	/* server cert is invalid */
+			ret = SSL_TLSEXT_ERR_ALERT_FATAL;
+		break;
+
+		case 1:	/* yes */
+			ret = SSL_TLSEXT_ERR_OK;
+		break;
+
+		case 2:	/* skipped */
+			ret = SSL_TLSEXT_ERR_NOACK;
+		break;
+	}
+
+	X509_free(issuer_cert);	/* Decrement reference count on issuer cert */
+	X509_STORE_CTX_free(server_store_ctx);
+	X509_STORE_free(server_store);
+
+	return ret;
+}
+
 #endif	/* HAVE_OPENSSL_OCSP_H */
 
 /*
@@ -3468,7 +3717,7 @@ int cbtls_verify(int ok, X509_STORE_CTX *ctx)
 				 *	run the external verification routine.  If it's marked as
 				 *	"skip verify on OK", then we don't do verify.
 				 */
-				my_ok = ocsp_check(request, ocsp_store, issuer_cert, client_cert, untrusted, conf);
+				my_ok = ocsp_check(request, ssl, untrusted, ocsp_store, issuer_cert, client_cert, conf, false);
 				if (my_ok != OCSP_STATUS_FAILED) {
 					do_verify = !conf->verify_skip_if_ocsp_ok;
 				}
@@ -4951,6 +5200,14 @@ skip_list:
 	if (conf->ocsp_enable) {
 		conf->ocsp_store = fr_init_x509_store(conf);
 		if (conf->ocsp_store == NULL) goto error;
+	}
+
+	/*
+	 *	Configure OCSP stapling for the server cert
+	 */
+	if (conf->ocsp_stapling) {
+	    SSL_CTX_set_tlsext_status_cb(conf->ctx, fr_tls_ocsp_staple_cb);
+	    SSL_CTX_set_tlsext_status_arg(conf->ctx, conf);
 	}
 #endif /*HAVE_OPENSSL_OCSP_H*/
 
